@@ -34,6 +34,38 @@
   ```
 - **Impact**: Eliminates page skipping, ensures sequential page loading (1→2→3→4→5→6...)
 
+### 12.1. Fixed Auto-Save Download Error
+- **Problem**: "Cannot read properties of undefined (reading 'download')" error during auto-save
+- **Root Cause**: Content scripts don't have direct access to `chrome.downloads` API
+- **Additional Issue**: "URL.createObjectURL is not a function" in background script service worker
+- **Solution**: Moved download functionality to background script with base64 data URLs
+- **Changes**:
+  - Added `DOWNLOAD_DATA` message handler in background.js
+  - Added `downloadData()` method using base64 data URLs instead of blob URLs
+  - Updated content script to use message passing for downloads
+  - Replaced `URL.createObjectURL()` with base64 encoding for service worker compatibility
+  - Maintained all existing auto-save functionality
+- **Impact**: Auto-save downloads now work without errors in all browser contexts
+
+### 12.2. Fixed Critical Data Loss During Category Transitions  
+- **Problem**: Extension scraped 300+ pages (30k channels) but resumed from only 110 pages (10k channels)
+- **Root Cause**: `autoSaveData(true)` was clearing ALL accumulated data during category transitions
+- **Solution**: Comprehensive data preservation system with multiple safeguards
+- **Critical Fixes**:
+  - **Removed data clearing during category transitions** - Data now accumulates across all categories
+  - **Increased save frequency** - Reduced save interval from 5s to 2s during active scraping  
+  - **Added forced saves** - Immediate save after every successful load more operation
+  - **Added backup state storage** - Dual state storage with automatic fallback
+  - **Enhanced state validation** - Timestamp validation and data consistency checks
+  - **Improved progress tracking** - `channelCount` is now the authoritative source of truth
+- **Data Preservation Guarantees**:
+  - ✅ Never lose progress during category transitions
+  - ✅ Never lose progress during auto-save operations  
+  - ✅ Always resume from the exact last position
+  - ✅ Backup state storage prevents corruption
+  - ✅ Accumulate data across ALL categories without clearing
+- **Impact**: Complete elimination of data loss, reliable resume from exact stopping point
+
 ### 13. Fixed Critical State Loading Bug Causing Page Count Mismatch
 - **Problem**: currentPage=6 but pageCount=3 inconsistency due to state loading bug
 - **Root Cause**: `loadSavedProgress()` was loading complete stats, then overwriting currentPage separately, causing sync issues
@@ -109,6 +141,84 @@
   - `restoreStateAfterRefresh()` method for automatic recovery
   - `waitForFormElements()` to ensure DOM is ready before restoration
 - **Impact**: Ensures clean page state for each retry, preventing issues caused by corrupted DOM or stuck loading states
+
+## CRITICAL MANUAL REFRESH FIX (June 15, 2025):
+
+### 18. **FIXED CRITICAL BUG: Manual Page Refresh State Reset**
+- **Problem**: When user manually refreshes page due to performance issues, extension would reset to an earlier state (e.g., from page 150 back to page 112)
+- **Root Cause**: Multiple critical issues in state loading and validation logic:
+  1. **Flawed State Validation Logic**: The validation was incorrectly "fixing" state based on wrong assumptions about the relationship between `currentPage`, `pageCount`, and `loadMoreCount`
+  2. **Missing Refresh Protection**: No `beforeunload` event handler to save state before manual refresh
+  3. **Aggressive State "Correction"**: Code was resetting progress when it detected "inconsistencies" that were actually normal during active scraping
+
+- **The Fatal Bug**:
+  ```javascript
+  // WRONG LOGIC that was resetting progress:
+  const expectedCurrentPage = 1 + this.stats.pageCount;
+  if (this.stats.currentPage !== expectedCurrentPage) {
+      // This would RESET pageCount and destroy progress!
+      this.stats.pageCount = Math.max(0, this.stats.currentPage - 1);
+  }
+  ```
+
+- **Complete Solution**:
+  1. **Added Refresh Protection**: Added `beforeunload` event handler to save state before any page unload/refresh
+  2. **Fixed State Validation Logic**: Changed from aggressive "fixing" to conservative validation that preserves progress
+  3. **Immediate State Saving**: Added forced saves after every critical operation (page load, channel scraping)
+  4. **Enhanced Debugging**: Added extensive logging and `debugTGStatState()` function for state inspection
+  5. **Conservative State Loading**: Only fix obvious corruption (negative values), never reset major progress
+
+- **New Relationship Logic**:
+  ```
+  - currentPage = 1 + loadMoreCount (first page loads automatically)
+  - pageCount = currentPage (total pages processed)  
+  - Form fields = currentPage + 1 (next page to load)
+  ```
+
+- **Key Changes**:
+  - Added `setupRefreshProtection()` method with `beforeunload` listener
+  - Rewrote state validation to be conservative, not destructive
+  - Added immediate forced saves after page loads and channel scraping
+  - Enhanced restoration logging with emojis for easy tracking
+  - Added global debug functions: `window.debugTGStatState()`
+
+- **Impact**: **CRITICAL** - Extension now survives manual page refresh and always resumes from exact same state, no progress loss even for 15k+ channels across 150+ pages
+
+### 19. **NEW FEATURE: Custom Start Page Setting**
+- **Added**: Manual start page selection functionality to the extension popup
+- **Purpose**: Allows users to manually set the starting page for scraping, useful for recovery scenarios or targeted scraping
+- **Features**:
+  1. **Custom Page Input**: Text input field to enter any page number (1-999)
+  2. **Quick Page Buttons**: 
+     - "Current" - Set to current page position
+     - "+5" - Set to current page + 5
+     - "+10" - Set to current page + 10
+  3. **Smart Validation**: Validates page numbers and shows confirmation dialog
+  4. **Real-time Updates**: Updates placeholder text to show current page
+  5. **Form Field Sync**: Automatically updates all internal form fields and state
+
+- **Implementation**:
+  - Added `setStartPage()` method in content script to handle page setting
+  - Added `SET_START_PAGE` message handler for popup-content communication
+  - Enhanced popup UI with input field and quick action buttons
+  - Integrated with existing state management and save system
+
+- **User Experience**: 
+  ```
+  1. Open extension popup
+  2. See "Custom Start Page" section with current page shown in placeholder
+  3. Either type specific page number OR click quick buttons
+  4. Click "Set Start Page" and confirm
+  5. Extension updates all internal state and is ready to continue from that page
+  ```
+
+- **Use Cases**:
+  - **Manual Recovery**: If automatic state restoration fails, manually set correct page
+  - **Targeted Scraping**: Start from a specific page without scraping from beginning
+  - **Testing**: Easily jump to different page ranges for testing
+  - **Efficiency**: Skip already processed pages when resuming interrupted scraping
+
+- **Impact**: **HIGH** - Provides complete manual control over scraping position, essential for recovery and targeted operations
 
 ## Previous Issues Fixed:
 

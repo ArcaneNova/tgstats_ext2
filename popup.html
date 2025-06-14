@@ -147,14 +147,27 @@
 
     <div id="categoryInfo" style="display: none; background-color: #f8f9fa; padding: 10px; border-radius: 5px; margin: 10px 0;">
         <!-- Category progress will be shown here -->
-    </div>
-
-    <div style="margin: 15px 0;">
+    </div>    <div style="margin: 15px 0;">
         <label for="categorySelect" style="display: block; margin-bottom: 5px; font-size: 12px; color: #666;">Navigate to Category:</label>
         <select id="categorySelect" style="width: 70%; margin-right: 5px; padding: 5px; border: 1px solid #ddd; border-radius: 3px; font-size: 12px;">
             <option value="">Select Category</option>
         </select>
         <button id="navigateBtn" style="width: 25%; padding: 5px; background: #007bff; color: white; border: none; border-radius: 3px; font-size: 12px; cursor: pointer;">Go</button>
+    </div>    <div style="margin: 15px 0; padding: 10px; background-color: #f0f8ff; border: 1px solid #b3d9ff; border-radius: 5px;">
+        <label for="startPageInput" style="display: block; margin-bottom: 5px; font-size: 12px; color: #666; font-weight: bold;">Custom Start Page:</label>
+        <div style="display: flex; align-items: center; gap: 5px; margin-bottom: 5px;">
+            <input type="number" id="startPageInput" min="1" max="999" placeholder="e.g. 113" 
+                   style="width: 50%; padding: 5px; border: 1px solid #ddd; border-radius: 3px; font-size: 12px;">
+            <button id="setStartPageBtn" style="width: 45%; padding: 5px; background: #17a2b8; color: white; border: none; border-radius: 3px; font-size: 12px; cursor: pointer;">Set Start Page</button>
+        </div>
+        <div style="display: flex; gap: 3px; margin-bottom: 5px;">
+            <button id="setCurrentPageBtn" style="flex: 1; padding: 3px; background: #6c757d; color: white; border: none; border-radius: 2px; font-size: 10px; cursor: pointer;">Current</button>
+            <button id="setCurrentPlus5Btn" style="flex: 1; padding: 3px; background: #6c757d; color: white; border: none; border-radius: 2px; font-size: 10px; cursor: pointer;">+5</button>
+            <button id="setCurrentPlus10Btn" style="flex: 1; padding: 3px; background: #6c757d; color: white; border: none; border-radius: 2px; font-size: 10px; cursor: pointer;">+10</button>
+        </div>
+        <div style="font-size: 11px; color: #6c757d;">
+            💡 Use this to manually start from a specific page (e.g., after refresh issues)
+        </div>
     </div>
 
     <div id="downloadOptions" style="display: none; text-align: center; margin-top: 15px;">

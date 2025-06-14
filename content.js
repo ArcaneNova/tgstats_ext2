@@ -89,7 +89,7 @@ class TGStatScraper {
         this.consecutiveEmptyPages = 0;
         this.maxEmptyPages = 10; // Increased to 10 for better detection
         this.lastSavedState = null;
-        this.saveInterval = 5000;
+        this.saveInterval = 2000; // Save every 2 seconds during active scraping
         this.lastSaveTime = 0;
         this.offlineQueue = [];
         this.isOffline = false;
@@ -97,7 +97,7 @@ class TGStatScraper {
         this.processingQueue = [];
         this.maxQueueSize = 50000;
         
-        // Enhanced error handling
+        // Enhanced error handling and retry system
         this.networkErrorCount = 0;
         this.maxNetworkErrors = 3;
         this.lastNetworkError = 0;
@@ -106,6 +106,18 @@ class TGStatScraper {
         this.maxLoadMoreFailures = 10; // Increased to 10 retries before giving up
         this.noDataRetryCount = 0;
         this.maxNoDataRetries = 15; // Retry 15 times if no data loads
+        
+        // Smart retry and reload system
+        this.smartRetryCount = 0;
+        this.maxSmartRetries = 15; // Total retry attempts
+        this.pageReloadCount = 0;
+        this.maxPageReloads = 3; // Maximum page reloads before moving to next category
+        this.retryWithReloadAfter = 5; // Reload page after 5 failed retries
+        this.isInRetryMode = false;
+        this.retryStartTime = null;
+        this.lastRetryTime = 0;
+        this.progressiveRetryDelays = [2000, 3000, 5000, 8000, 12000]; // Progressive delays
+        this.currentRetryDelayIndex = 0;
         this.autoMode = false;
         this.waitingForConfirmation = false;
         this.confirmationTimeout = 30000; // 30 seconds to confirm
@@ -121,13 +133,14 @@ class TGStatScraper {
         this.lastSuccessfulOffsetKey = 'tgstatLastSuccessfulOffset';
         this.formDataKey = 'tgstatFormData';
         this.categoryProgressKey = 'tgstatCategoryProgress';
-        this.autoModeKey = 'tgstatAutoMode';
-          this.initializeMessageListener();
+        this.autoModeKey = 'tgstatAutoMode';        this.initializeMessageListener();
         this.loadSavedProgress();
         this.startPeriodicCleanup();
+        this.startPeriodicForceSave(); // Force save every 30 seconds
         this.initializeFormData();
         this.checkOnlineStatus();
         this.setupConfirmationListener();
+        this.setupRefreshProtection(); // Critical: Save state before refresh
     }
 
     checkOnlineStatus() {
@@ -139,9 +152,7 @@ class TGStatScraper {
         window.addEventListener('offline', () => {
             this.isOffline = true;
         });
-    }
-
-    async processOfflineQueue() {
+    }    async processOfflineQueue() {
         if (this.offlineQueue.length > 0) {
             console.log(`Processing ${this.offlineQueue.length} items from offline queue`);
             for (const item of this.offlineQueue) {
@@ -150,7 +161,45 @@ class TGStatScraper {
             this.offlineQueue = [];
             await this.saveProgress();
         }
-    }    initializeMessageListener() {
+    }
+
+    setupRefreshProtection() {
+        // Save state before page refresh/unload to ensure no progress is lost
+        window.addEventListener('beforeunload', (event) => {
+            // Always save current state before any page unload
+            const refreshKey = 'tgstat_refresh_in_progress';
+            const stateKey = 'tgstat_pre_refresh_state';
+            
+            // Mark that a refresh is happening
+            localStorage.setItem(refreshKey, 'true');
+            
+            // Save the current state to localStorage for immediate access
+            const preRefreshState = {
+                autoMode: this.autoMode,
+                isRunning: this.isRunning,
+                currentCategoryIndex: this.currentCategoryIndex,
+                categoryProgress: this.categoryProgress,
+                timestamp: Date.now()
+            };
+            localStorage.setItem(stateKey, JSON.stringify(preRefreshState));
+            
+            // Force save all data to chrome storage (synchronous as much as possible)
+            this.saveProgress(true).catch(error => {
+                console.error('Error saving progress before refresh:', error);
+            });
+            
+            console.log('State saved before page unload/refresh');
+        });
+        
+        // Also save on visibility change (when tab is backgrounded)
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                this.saveProgress(true).catch(error => {
+                    console.error('Error saving progress on visibility change:', error);
+                });
+            }
+        });
+    }initializeMessageListener() {
         chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             switch (message.type) {
                 case 'START_SCRAPING':
@@ -179,9 +228,13 @@ class TGStatScraper {
                     break;
                 case 'GET_CATEGORIES':
                     sendResponse({ categories: this.categories });
-                    break;
-                case 'NAVIGATE_TO_CATEGORY':
+                    break;                case 'NAVIGATE_TO_CATEGORY':
                     this.navigateToCategory(message.categoryIndex).then(result => {
+                        sendResponse({ success: result });
+                    });
+                    break;
+                case 'SET_START_PAGE':
+                    this.setStartPage(message.startPage).then(result => {
                         sendResponse({ success: result });
                     });
                     break;
@@ -205,13 +258,69 @@ class TGStatScraper {
                 
                 window.location.href = category.url;
                 return true;
-            }
-            return false;
+            }            return false;
         } catch (error) {
             console.error('Error navigating to category:', error);
             return false;
         }
-    }    initializeFormData() {
+    }
+
+    async setStartPage(startPage) {
+        try {
+            console.log(`🎯 Setting start page to: ${startPage}`);
+            
+            // Validate input
+            if (!startPage || startPage < 1 || startPage > 999) {
+                console.error('Invalid start page:', startPage);
+                return false;
+            }
+            
+            // Stop any running scraping
+            if (this.isRunning) {
+                this.stopScraping();
+                console.log('Stopped current scraping before setting start page');
+            }
+            
+            // Update stats to reflect the new start page
+            this.stats.currentPage = startPage;
+            this.stats.loadMoreCount = startPage - 1; // Page 1 loads automatically, so loadMoreCount = currentPage - 1
+            this.stats.pageCount = startPage;
+            this.stats.lastOffset = (startPage - 1) * 20; // Each page has 20 items
+            this.stats.lastSuccessfulPage = startPage;
+            this.stats.lastSuccessfulOffset = this.stats.lastOffset;
+            
+            console.log('Updated stats for start page:', {
+                currentPage: this.stats.currentPage,
+                loadMoreCount: this.stats.loadMoreCount,
+                pageCount: this.stats.pageCount,
+                lastOffset: this.stats.lastOffset
+            });
+            
+            // Update form fields to the correct values
+            this.updateFormFields();
+            
+            // Initialize form data with correct values
+            this.initializeFormData();
+            
+            // Save the new state immediately
+            await this.saveProgress(true);
+            console.log('💾 Saved new start page state');
+            
+            // Send update to popup
+            this.sendUpdate({
+                status: 'info',
+                message: `Start page set to ${startPage}. Ready to continue scraping.`,
+                stats: this.stats
+            });
+            
+            console.log(`✅ Successfully set start page to ${startPage}`);
+            return true;
+            
+        } catch (error) {
+            console.error('Error setting start page:', error);
+            return false;
+        }
+    }initializeFormData() {
         try {
             const form = document.querySelector('#category-list-form');
             if (form) {
@@ -229,8 +338,7 @@ class TGStatScraper {
             console.error('Error initializing form data:', error);
         }
     }async loadSavedProgress() {
-        try {
-            const result = await chrome.storage.local.get([
+        try {            const result = await chrome.storage.local.get([
                 this.progressStorageKey,
                 this.processedUrlsKey,
                 this.lastSuccessfulPageKey,
@@ -238,6 +346,7 @@ class TGStatScraper {
                 this.existingIdsKey,
                 this.formDataKey,
                 this.lastSavedStateKey,
+                `${this.lastSavedStateKey}_backup`, // Load backup too
                 this.dataStorageKey,
                 this.categoryProgressKey,
                 this.autoModeKey
@@ -253,28 +362,70 @@ class TGStatScraper {
             // Load auto mode state
             if (result[this.autoModeKey]) {
                 this.autoMode = result[this.autoModeKey];
-            }
-              if (result[this.lastSavedStateKey]) {
-                this.lastSavedState = result[this.lastSavedStateKey];
+            }            if (result[this.lastSavedStateKey] || result[`${this.lastSavedStateKey}_backup`]) {
+                // Use primary state, fallback to backup if primary is corrupted
+                this.lastSavedState = result[this.lastSavedStateKey] || result[`${this.lastSavedStateKey}_backup`];
+                
+                if (!result[this.lastSavedStateKey] && result[`${this.lastSavedStateKey}_backup`]) {
+                    console.warn('Primary state corrupted, using backup state');
+                }
+                  // Validate timestamp to ensure we're loading recent state
+                const stateAge = Date.now() - (this.lastSavedState.timestamp || 0);
+                console.log(`📊 Loading saved state from ${new Date(this.lastSavedState.timestamp).toISOString()}, age: ${Math.round(stateAge/1000)}s`);
+                
+                console.log('📈 Original stats before restoration:', JSON.stringify(this.stats, null, 2));
+                
                 // Restore stats completely from saved state to prevent double counting
                 this.stats = { ...this.lastSavedState.stats };
                 this.processedUrls = new Set(this.lastSavedState.processedUrls);
                 this.existingIds = new Set(this.lastSavedState.existingIds);
                 
-                console.log('Loaded saved state with stats:', this.stats);// Load existing data
+                console.log('📈 Stats after restoration:', JSON.stringify(this.stats, null, 2));// Load existing data
                 if (result[this.dataStorageKey]) {
                     this.scrapedData = result[this.dataStorageKey];
-                    console.log(`Loaded ${this.scrapedData.length} existing channels`);
-                }
-                  // Validate and fix pageCount vs currentPage consistency
-                // currentPage should equal 1 + pageCount (since page 1 loads automatically)
-                const expectedCurrentPage = 1 + this.stats.pageCount;
-                if (this.stats.currentPage !== expectedCurrentPage) {
-                    console.warn(`Inconsistent state detected. currentPage: ${this.stats.currentPage}, pageCount: ${this.stats.pageCount}. Expected currentPage: ${expectedCurrentPage}`);
+                    console.log(`Loaded ${this.scrapedData.length} existing channels from storage`);
                     
-                    // Fix by adjusting pageCount to match currentPage
-                    this.stats.pageCount = Math.max(0, this.stats.currentPage - 1);
-                    console.log(`Fixed pageCount to: ${this.stats.pageCount}`);
+                    // Validate data consistency
+                    if (this.scrapedData.length !== this.stats.channelCount) {
+                        console.warn(`Data inconsistency detected! Scraped data: ${this.scrapedData.length}, Channel count: ${this.stats.channelCount}`);
+                        console.warn('This may indicate data was cleared during auto-save. Channel count is the authoritative source.');
+                        
+                        // If we have fewer items in scrapedData than channelCount, 
+                        // it means some data was auto-saved and cleared.
+                        // We should trust the channelCount as the authoritative number.
+                    }
+                } else {
+                    this.scrapedData = [];
+                    console.log('No existing scraped data found in storage');
+                }                // State validation: Only fix obvious inconsistencies, never reset major progress
+                // Be extremely conservative - trust the saved state unless there's clear corruption
+                
+                // Basic sanity checks only
+                if (this.stats.currentPage < 1) {
+                    console.warn(`Invalid currentPage detected: ${this.stats.currentPage}, fixing to 1`);
+                    this.stats.currentPage = 1;
+                }
+                
+                if (this.stats.loadMoreCount < 0) {
+                    console.warn(`Invalid loadMoreCount detected: ${this.stats.loadMoreCount}, fixing to 0`);
+                    this.stats.loadMoreCount = 0;
+                }
+                
+                if (this.stats.pageCount < 0) {
+                    console.warn(`Invalid pageCount detected: ${this.stats.pageCount}, fixing to 0`);
+                    this.stats.pageCount = 0;
+                }
+                
+                // Only log differences, don't "fix" them automatically as this could reset progress
+                const expectedCurrentPage = 1 + this.stats.loadMoreCount;
+                if (this.stats.currentPage !== expectedCurrentPage) {
+                    console.log(`State variance detected - currentPage: ${this.stats.currentPage}, loadMoreCount: ${this.stats.loadMoreCount}, expected: ${expectedCurrentPage}`);
+                    console.log('This is normal during active scraping. Not auto-fixing to preserve progress.');
+                }
+                
+                if (this.stats.pageCount !== this.stats.currentPage) {
+                    console.log(`State variance detected - pageCount: ${this.stats.pageCount}, currentPage: ${this.stats.currentPage}`);
+                    console.log('This is normal during active scraping. Not auto-fixing to preserve progress.');
                 }
                 
                 console.log('Loaded last saved state:', {
@@ -326,11 +477,12 @@ class TGStatScraper {
         } catch (error) {
             console.error('Error updating form fields:', error);
         }
-    }async saveProgress() {
+    }    async saveProgress(forceSave = false) {
         try {
             const currentTime = Date.now();
             
-            if (currentTime - this.lastSaveTime < this.saveInterval) {
+            // Only throttle if not forced and within save interval
+            if (!forceSave && currentTime - this.lastSaveTime < this.saveInterval) {
                 return;
             }
 
@@ -352,10 +504,9 @@ class TGStatScraper {
                 timestamp: currentTime,
                 categoryProgress: { ...this.categoryProgress },
                 autoMode: this.autoMode
-            };
-
-            await chrome.storage.local.set({
+            };            await chrome.storage.local.set({
                 [this.lastSavedStateKey]: stateSnapshot,
+                [`${this.lastSavedStateKey}_backup`]: stateSnapshot, // Backup copy
                 [this.progressStorageKey]: this.stats,
                 [this.processedUrlsKey]: Array.from(this.processedUrls),
                 [this.lastSuccessfulPageKey]: this.stats.lastSuccessfulPage.toString(),
@@ -427,19 +578,97 @@ class TGStatScraper {
             console.error('Error in refreshPageAndRestoreState:', error);
             throw error;
         }
-    }
-
-    async restoreStateAfterRefresh() {
+    }    async restoreStateAfterRefresh() {
         try {
             const refreshKey = 'tgstat_refresh_in_progress';
             const stateKey = 'tgstat_pre_refresh_state';
+            const smartReloadKey = 'tgstat_smart_reload_in_progress';
+            const smartReloadStateKey = 'tgstat_pre_reload_state';
             
+            // Check for smart reload first
+            if (localStorage.getItem(smartReloadKey) === 'true') {
+                console.log('🔄 DETECTED SMART RELOAD - Starting intelligent state restoration...');
+                
+                const preReloadStateStr = localStorage.getItem(smartReloadStateKey);
+                if (preReloadStateStr) {
+                    const preReloadState = JSON.parse(preReloadStateStr);
+                    
+                    console.log('📦 Pre-reload state found:', preReloadState);
+                    
+                    // Restore basic state
+                    this.autoMode = preReloadState.autoMode;
+                    this.currentCategoryIndex = preReloadState.currentCategoryIndex;
+                    this.categoryProgress = { ...preReloadState.categoryProgress };
+                    this.isRunning = preReloadState.isRunning;
+                    
+                    // Restore retry context
+                    this.smartRetryCount = preReloadState.smartRetryCount || 0;
+                    this.pageReloadCount = preReloadState.pageReloadCount || 0;
+                    this.retryStartTime = preReloadState.retryStartTime;
+                    this.isInRetryMode = true;
+                    
+                    console.log('✅ Smart reload state restored:', {
+                        smartRetryCount: this.smartRetryCount,
+                        pageReloadCount: this.pageReloadCount,
+                        isInRetryMode: this.isInRetryMode
+                    });
+                    
+                    // Clear the smart reload flags
+                    localStorage.removeItem(smartReloadKey);
+                    localStorage.removeItem(smartReloadStateKey);
+                    
+                    // Load the full saved state
+                    await this.loadSavedProgress();
+                    
+                    // Restore reload context from chrome storage if available
+                    const reloadContextResult = await chrome.storage.local.get(['tgstat_reload_context']);
+                    if (reloadContextResult.tgstat_reload_context) {
+                        const reloadContext = reloadContextResult.tgstat_reload_context;
+                        console.log('📦 Restored reload context:', reloadContext.retryContext);
+                        
+                        // Restore retry context
+                        this.smartRetryCount = reloadContext.retryContext.smartRetryCount || this.smartRetryCount;
+                        this.pageReloadCount = reloadContext.retryContext.pageReloadCount || this.pageReloadCount;
+                        this.retryStartTime = reloadContext.retryContext.retryStartTime || this.retryStartTime;
+                        this.isInRetryMode = reloadContext.retryContext.isInRetryMode || this.isInRetryMode;
+                        
+                        // Clean up reload context
+                        await chrome.storage.local.remove(['tgstat_reload_context']);
+                    }
+                    
+                    // Restore form fields
+                    await this.restoreFormFields();
+                    
+                    console.log('🎉 SMART RELOAD COMPLETED - Extension ready to continue with retry context!');
+                    console.log('📊 Final state after smart reload:', {
+                        currentPage: this.stats.currentPage,
+                        smartRetryCount: this.smartRetryCount,
+                        pageReloadCount: this.pageReloadCount,
+                        autoMode: this.autoMode,
+                        isInRetryMode: this.isInRetryMode
+                    });
+                    
+                    // If we were running before reload, continue scraping after a brief delay
+                    if (this.isRunning && this.autoMode) {
+                        console.log('🚀 Auto-resuming scraping after smart reload...');
+                        setTimeout(() => {
+                            this.start();
+                        }, 3000); // Give page time to fully load
+                    }
+                    
+                    return true;
+                }
+            }
+            
+            // Check for regular refresh
             if (localStorage.getItem(refreshKey) === 'true') {
-                console.log('Detected page refresh, restoring state...');
+                console.log('🔄 DETECTED PAGE REFRESH - Starting state restoration...');
                 
                 const preRefreshStateStr = localStorage.getItem(stateKey);
                 if (preRefreshStateStr) {
                     const preRefreshState = JSON.parse(preRefreshStateStr);
+                    
+                    console.log('📦 Pre-refresh state found:', preRefreshState);
                     
                     // Restore basic state
                     this.autoMode = preRefreshState.autoMode;
@@ -447,29 +676,45 @@ class TGStatScraper {
                     this.categoryProgress = { ...preRefreshState.categoryProgress };
                     this.isRunning = preRefreshState.isRunning;
                     
+                    console.log('✅ Basic state restored from pre-refresh data');
+                    
                     // Clear the refresh flags
                     localStorage.removeItem(refreshKey);
                     localStorage.removeItem(stateKey);
                     
-                    console.log('Pre-refresh state restored, loading full state...');
+                    console.log('🔍 Loading full saved state from chrome storage...');
                     
                     // Load the full saved state
                     await this.loadSavedProgress();
                     
+                    console.log('📄 Current state after full load:', {
+                        currentPage: this.stats.currentPage,
+                        loadMoreCount: this.stats.loadMoreCount,
+                        pageCount: this.stats.pageCount,
+                        channelCount: this.stats.channelCount,
+                        lastOffset: this.stats.lastOffset,
+                        category: this.categoryProgress.currentCategoryName,
+                        autoMode: this.autoMode
+                    });
+                    
                     // Restore form fields to the correct position
                     await this.restoreFormFields();
                     
-                    console.log('State fully restored after refresh');
+                    console.log('🎉 STATE FULLY RESTORED AFTER REFRESH - Extension ready to continue!');
                     return true;
+                } else {
+                    console.warn('❌ Refresh detected but no pre-refresh state found');
                 }
+            } else {
+                console.log('ℹ️ No page refresh detected, normal initialization');
             }
             
             return false;
         } catch (error) {
-            console.error('Error restoring state after refresh:', error);
+            console.error('💥 Error restoring state after refresh:', error);
             return false;
         }
-    }    async restoreFormFields() {
+    }async restoreFormFields() {
         try {
             // Wait for form elements to be available
             await this.waitForFormElements();
@@ -596,15 +841,12 @@ class TGStatScraper {
                 this.stats.channelCount += uniqueChunk.length;                uniqueChunk.forEach(channel => {
                     this.existingIds.add(channel.uniqueId);
                     this.processedUrls.add(channel.url);
-                });
-
-                this.sendUpdate({
+                });                this.sendUpdate({
                     status: 'progress',
                     message: `Processed ${uniqueChunk.length} new channels (Total: ${this.stats.channelCount})`,
                     stats: this.stats
-                });
-
-                await this.saveProgress();
+                });                // Force save after every batch to prevent any data loss
+                await this.saveProgress(true);
 
                 if (this.stats.channelCount - this.stats.lastSaveCount >= this.autoSaveThreshold) {
                     await this.autoSaveData();
@@ -815,38 +1057,37 @@ class TGStatScraper {
                 await this.flushProcessingQueue();
 
                 const result = await chrome.storage.local.get([this.dataStorageKey]);
-                const data = result[this.dataStorageKey] || [];
-
-                if (data.length > 0) {
+                const data = result[this.dataStorageKey] || [];                if (data.length > 0) {
                     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
                     const categoryName = this.getCurrentCategoryName();
                     const filename = `tgstat_${categoryName}_${timestamp}_${data.length}items.json`;
                     
-                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                    const url = URL.createObjectURL(blob);
+                    // Use message passing to background script for download
+                    const downloadResult = await new Promise((resolve) => {
+                        chrome.runtime.sendMessage({
+                            type: 'DOWNLOAD_DATA',
+                            data: {
+                                data: data,
+                                filename: filename
+                            }
+                        }, resolve);
+                    });
                     
-                    await chrome.downloads.download({
-                        url: url,
-                        filename: filename,
-                        saveAs: false
-                    });
+                    if (downloadResult.success) {
+                        this.stats.lastSaveCount = this.stats.channelCount;
+                        this.categoryProgress.categoryDataCount += data.length;
+                        await this.saveProgress();
 
-                    this.stats.lastSaveCount = this.stats.channelCount;
-                    this.categoryProgress.categoryDataCount += data.length;
-                    await this.saveProgress();
-
-                    this.sendUpdate({
-                        status: 'autosave',
-                        message: `Auto-saved ${data.length} channels to ${filename}`,
-                        stats: this.stats,
-                        categoryProgress: this.categoryProgress
-                    });
-
-                    // Clear data after download to free memory
-                    if (forceDownload) {
-                        await chrome.storage.local.set({ [this.dataStorageKey]: [] });
-                        this.scrapedData = [];
-                        console.log('Cleared data after category completion');
+                        this.sendUpdate({
+                            status: 'autosave',
+                            message: `Auto-saved ${data.length} channels to ${filename}`,
+                            stats: this.stats,
+                            categoryProgress: this.categoryProgress
+                        });                        // Never automatically clear accumulated data during category transitions
+                        // Data should only be cleared on explicit user reset action
+                        console.log(`Auto-saved ${data.length} channels. Total accumulated: ${this.stats.channelCount}`);
+                    } else {
+                        throw new Error(downloadResult.error || 'Download failed');
                     }
 
                     this.cleanupMemory();
@@ -975,7 +1216,7 @@ class TGStatScraper {
                     message: `Processing page ${this.stats.currentPage} - ${this.categoryProgress.currentCategoryName || 'Unknown Category'}`,
                     stats: this.stats,
                     categoryProgress: this.categoryProgress
-                });// Scrape current page
+                });                // Scrape current page
                 const newChannels = await this.scrapeCurrentPage();
                 
                 if (newChannels.length > 0) {
@@ -983,6 +1224,12 @@ class TGStatScraper {
                     this.consecutiveEmptyPages = 0;
                     this.loadMoreFailureCount = 0; // Reset failure count on success
                     this.noDataRetryCount = 0; // Reset no data retry count on success
+                    
+                    console.log(`📊 CRITICAL: Scraped ${newChannels.length} channels from page ${this.stats.currentPage}, total: ${this.stats.channelCount}`);
+                    
+                    // IMMEDIATELY force save this critical state update
+                    await this.saveProgress(true);
+                    console.log('💾 Critical channel count saved immediately after scraping');
                     
                     this.sendUpdate({
                         newChannels: newChannels,
@@ -1179,18 +1426,15 @@ class TGStatScraper {
             const nextPageToLoad = parseInt(pageInput.value) || 1;
             const nextOffsetToLoad = parseInt(offsetInput.value) || 0;
 
-            console.log('About to load page:', nextPageToLoad, 'Offset:', nextOffsetToLoad);
-
-            // Save progress with current page info before loading more
-            await this.saveProgress();
+            console.log('About to load page:', nextPageToLoad, 'Offset:', nextOffsetToLoad);            // Save progress with current page info before loading more
+            await this.saveProgress(true);
 
             // Click the load more button (it will use the current form values)
             loadMoreBtn.click();
 
             // Wait for new content
             const success = await this.waitForNewContent();
-            
-            if (success) {
+              if (success) {
                 // Update stats - we successfully loaded nextPageToLoad
                 this.stats.lastSuccessfulPage = nextPageToLoad;
                 this.stats.lastSuccessfulOffset = nextOffsetToLoad;
@@ -1198,6 +1442,17 @@ class TGStatScraper {
                 this.stats.lastOffset = nextOffsetToLoad;
                 this.stats.pageCount++; // Increment page count (number of load more operations)
                 this.stats.loadMoreCount++; // Increment load more count only on successful load
+                
+                console.log(`🎯 CRITICAL STATE UPDATE - Page ${nextPageToLoad} loaded successfully:`, {
+                    currentPage: this.stats.currentPage,
+                    loadMoreCount: this.stats.loadMoreCount,
+                    pageCount: this.stats.pageCount,
+                    lastOffset: this.stats.lastOffset
+                });
+                
+                // IMMEDIATELY force save this critical state update
+                await this.saveProgress(true);
+                console.log('💾 Critical state saved immediately after page load');
                 
                 // Now update form fields for the NEXT load more operation
                 const nextPageForForm = nextPageToLoad + 1;
@@ -1211,8 +1466,7 @@ class TGStatScraper {
                     this.formData.set('page', nextPageForForm.toString());
                     this.formData.set('offset', nextOffsetForForm.toString());
                 }
-                
-                console.log(`Successfully loaded page ${nextPageToLoad}. Load more count: ${this.stats.loadMoreCount}, Page count: ${this.stats.pageCount}, Current page: ${this.stats.currentPage}`);
+                  console.log(`Successfully loaded page ${nextPageToLoad}. Load more count: ${this.stats.loadMoreCount}, Page count: ${this.stats.pageCount}, Current page: ${this.stats.currentPage}`);
                 console.log(`Form updated for next load: page ${nextPageForForm}, offset ${nextOffsetForForm}`);
                 
                 // Reset failure counters on success
@@ -1220,8 +1474,9 @@ class TGStatScraper {
                 this.noDataRetryCount = 0;
                 this.consecutiveEmptyPages = 0;
                 
-                await this.saveProgress();
-                console.log('Successfully loaded new content. Now on page:', this.stats.currentPage, 'Load more count:', this.stats.loadMoreCount);            } else {
+                // Force save immediately after successful page load to prevent data loss
+                await this.saveProgress(true);
+                console.log(`✅ SAVED: Successfully loaded page ${this.stats.currentPage}, total channels: ${this.stats.channelCount}`);} else {
                 // Restore form to previous values if failed
                 pageInput.value = nextPageToLoad.toString();
                 offsetInput.value = nextOffsetToLoad.toString();
@@ -1439,9 +1694,8 @@ class TGStatScraper {
     }
 
     async moveToNextCategory() {
-        try {
-            // Save current progress
-            await this.saveProgress();
+        try {            // Save current progress
+            await this.saveProgress(true);
             
             // Auto-download current category data
             await this.autoSaveData(true);
@@ -1561,73 +1815,331 @@ class TGStatScraper {
         }
     }    async handleLoadMoreFailure() {
         this.loadMoreFailureCount++;
-        this.noDataRetryCount++;
+        this.smartRetryCount++;
+        this.isInRetryMode = true;
         
-        console.log(`Load more failed. Attempt ${this.loadMoreFailureCount}/${this.maxLoadMoreFailures}, No data retries: ${this.noDataRetryCount}/${this.maxNoDataRetries}`);        // First, try multiple retries before giving up
-        if (this.noDataRetryCount < this.maxNoDataRetries) {
+        if (!this.retryStartTime) {
+            this.retryStartTime = Date.now();
+        }
+        
+        const timeInRetryMode = Math.round((Date.now() - this.retryStartTime) / 1000);
+        
+        console.log(`🔄 SMART RETRY ${this.smartRetryCount}/${this.maxSmartRetries} - Load more failed, implementing intelligent retry...`);
+        
+        // Force save state before any retry attempt
+        await this.saveProgress(true);
+        
+        // Check if we should reload the page (every 5 retries)
+        const shouldReload = (this.smartRetryCount % this.retryWithReloadAfter === 0) && 
+                            (this.pageReloadCount < this.maxPageReloads);
+        
+        if (shouldReload) {
+            console.log(`🔄 SMART RELOAD: Attempting page reload (${this.pageReloadCount + 1}/${this.maxPageReloads})`);
+            
             this.sendUpdate({
                 status: 'warning',
-                message: `No data loaded, retrying... (${this.noDataRetryCount}/${this.maxNoDataRetries})`,
+                message: `Smart reload ${this.pageReloadCount + 1}/${this.maxPageReloads} - Attempting page refresh to bypass limits... (Retry ${this.smartRetryCount}/${this.maxSmartRetries})`,
                 stats: this.stats,
                 categoryProgress: this.categoryProgress
             });
             
-            // Wait a bit and try again
-            await this.delay(3000);
-            return false; // Continue trying
-        }
-        
-        // After max retries, show confirmation or auto-proceed
-        if (this.loadMoreFailureCount >= this.maxLoadMoreFailures || this.noDataRetryCount >= this.maxNoDataRetries) {
-            const currentCategoryData = this.categoryProgress.categoryDataCount || 0;
-            const totalScraped = this.stats.channelCount;
+            // Perform smart reload with state preservation
+            const reloadSuccess = await this.performSmartReload();
             
-            if (this.autoMode) {
-                // In auto mode, save data and move to next category automatically
-                this.sendUpdate({
-                    status: 'category_complete',
-                    message: `Category "${this.categoryProgress.currentCategoryName}" completed. Scraped ${currentCategoryData} items. Moving to next category...`,
-                    stats: this.stats,
-                    categoryProgress: this.categoryProgress
-                });
-                
-                await this.moveToNextCategory();
-                return true;
+            if (reloadSuccess) {
+                // Reset some counters after successful reload
+                this.loadMoreFailureCount = 0;
+                this.currentRetryDelayIndex = 0;
+                console.log('✅ Smart reload completed, continuing scraping...');
+                return false; // Continue scraping
             } else {
-                // In manual mode, show confirmation dialog
-                const action = await this.showConfirmationDialog(
-                    `Load more failed ${this.maxLoadMoreFailures} times and no new data after ${this.maxNoDataRetries} retries.<br><br>
-                     Current category: ${this.categoryProgress.currentCategoryName}<br>
-                     Data scraped this category: ${currentCategoryData} items<br>
-                     Total scraped: ${totalScraped} items<br><br>
-                     What would you like to do?`,
-                    [
-                        { text: 'Move to Next Category', action: 'CONTINUE_NEXT_CATEGORY', style: 'background: #28a745; color: white;' },
-                        { text: 'Retry Current Page', action: 'RETRY_CURRENT_PAGE', style: 'background: #ffc107; color: black;' },
-                        { text: 'Stop Scraping', action: 'STOP_SCRAPING', style: 'background: #dc3545; color: white;' }
-                    ]
-                );
-                
-                if (action === 'timeout') {
-                    // Default action on timeout - move to next category
-                    await this.moveToNextCategory();
-                }
-                return true;
+                console.warn('⚠️ Smart reload failed, continuing with regular retries...');
             }
         }
         
-        return false; // Continue trying
+        // Regular retry logic
+        if (this.smartRetryCount < this.maxSmartRetries) {
+            // Progressive delay strategy
+            const delayIndex = Math.min(this.currentRetryDelayIndex, this.progressiveRetryDelays.length - 1);
+            const delay = this.progressiveRetryDelays[delayIndex];
+            this.currentRetryDelayIndex++;
+            
+            this.sendUpdate({
+                status: 'warning',
+                message: `Intelligent retry ${this.smartRetryCount}/${this.maxSmartRetries} - Waiting ${delay/1000}s... (${timeInRetryMode}s in retry mode)`,
+                stats: this.stats,
+                categoryProgress: this.categoryProgress
+            });
+            
+            console.log(`⏳ Progressive delay: ${delay}ms (level ${delayIndex + 1})`);
+            await this.delay(delay);
+            
+            // Try different retry strategies
+            if (this.smartRetryCount % 3 === 0) {
+                console.log('🔧 Strategy: Reinitializing form data...');
+                await this.initializeFormData();
+            }
+            
+            if (this.smartRetryCount % 4 === 0) {
+                console.log('🔧 Strategy: Clearing browser cache...');
+                await this.clearBrowserCache();
+            }
+            
+            console.log(`🚀 Resuming scraping attempt ${this.smartRetryCount + 1}...`);
+            return false; // Continue trying
+        }
+        
+        // Exhausted all retries
+        console.log(`❌ All ${this.maxSmartRetries} smart retries exhausted`);
+        
+        // Reset retry state
+        this.resetRetryState();
+        
+        const currentCategoryData = this.categoryProgress.categoryDataCount || 0;
+        const totalScraped = this.stats.channelCount;
+        
+        if (this.autoMode) {
+            // In auto mode, automatically move to next category
+            this.sendUpdate({
+                status: 'category_complete',
+                message: `Category "${this.categoryProgress.currentCategoryName}" completed after ${this.maxSmartRetries} retry attempts. Scraped ${currentCategoryData} items. Moving to next category...`,
+                stats: this.stats,
+                categoryProgress: this.categoryProgress
+            });
+            
+            console.log('🏁 Auto mode: Moving to next category after retry exhaustion');
+            await this.moveToNextCategory();
+            return true;
+        } else {
+            // In manual mode, show options
+            const action = await this.showConfirmationDialog(
+                `Smart retry system exhausted all ${this.maxSmartRetries} attempts including ${this.pageReloadCount} page reloads.<br><br>
+                 Current category: ${this.categoryProgress.currentCategoryName}<br>
+                 Data scraped this category: ${currentCategoryData} items<br>
+                 Total scraped: ${totalScraped} items<br>
+                 Time in retry mode: ${timeInRetryMode} seconds<br><br>
+                 What would you like to do?`,
+                [
+                    { text: 'Move to Next Category', action: 'CONTINUE_NEXT_CATEGORY', style: 'background: #28a745; color: white;' },
+                    { text: 'Reset & Retry Current', action: 'RESET_RETRY_CURRENT', style: 'background: #ffc107; color: black;' },
+                    { text: 'Stop Scraping', action: 'STOP_SCRAPING', style: 'background: #dc3545; color: white;' }
+                ]
+            );
+            
+            if (action === 'RESET_RETRY_CURRENT') {
+                console.log('🔄 User chose to reset and retry current category');
+                this.resetRetryState();
+                return false; // Continue with fresh retry state
+            } else if (action === 'timeout' || action === 'CONTINUE_NEXT_CATEGORY') {
+                console.log('➡️ Moving to next category (timeout or user choice)');
+                await this.moveToNextCategory();
+            }
+            
+            return true;
+        }
+    }
+
+    resetRetryState() {
+        console.log('🔄 Resetting retry state...');
+        this.smartRetryCount = 0;
+        this.loadMoreFailureCount = 0;
+        this.noDataRetryCount = 0;
+        this.pageReloadCount = 0;
+        this.currentRetryDelayIndex = 0;
+        this.isInRetryMode = false;
+        this.retryStartTime = null;
+        this.lastRetryTime = 0;
+    }
+
+    async performSmartReload() {
+        try {
+            console.log('🔄 Starting smart reload process...');
+            
+            // Save current state with reload marker
+            await this.saveProgressBeforeReload();
+            
+            // Set reload protection flags
+            const refreshKey = 'tgstat_smart_reload_in_progress';
+            const stateKey = 'tgstat_pre_reload_state';
+            
+            localStorage.setItem(refreshKey, 'true');
+            localStorage.setItem(stateKey, JSON.stringify({
+                autoMode: this.autoMode,
+                isRunning: this.isRunning,
+                currentCategoryIndex: this.currentCategoryIndex,
+                categoryProgress: this.categoryProgress,
+                smartRetryCount: this.smartRetryCount,
+                pageReloadCount: this.pageReloadCount + 1,
+                retryStartTime: this.retryStartTime,
+                timestamp: Date.now(),
+                reason: 'smart_reload'
+            }));
+            
+            console.log('💾 State saved before smart reload');
+            
+            // Wait a moment for save to complete
+            await this.delay(1000);
+            
+            // Perform the reload
+            console.log('🔄 Executing page reload...');
+            window.location.reload();
+            
+            // This will not execute as page reloads, but kept for completeness
+            return true;
+            
+        } catch (error) {
+            console.error('❌ Error during smart reload:', error);
+            return false;
+        }
+    }
+
+    async saveProgressBeforeReload() {
+        try {
+            console.log('💾 Saving comprehensive state before reload...');
+            
+            // Force save all current progress
+            await this.saveProgress(true);
+            
+            // Save additional reload-specific state
+            const reloadState = {
+                timestamp: Date.now(),
+                reason: 'smart_reload',
+                retryContext: {
+                    smartRetryCount: this.smartRetryCount,
+                    pageReloadCount: this.pageReloadCount,
+                    retryStartTime: this.retryStartTime,
+                    isInRetryMode: this.isInRetryMode
+                },
+                stats: { ...this.stats },
+                categoryProgress: { ...this.categoryProgress },
+                autoMode: this.autoMode,
+                isRunning: this.isRunning
+            };
+            
+            await chrome.storage.local.set({
+                'tgstat_reload_context': reloadState
+            });
+            
+            console.log('✅ Reload context saved');
+            
+        } catch (error) {
+            console.error('❌ Error saving state before reload:', error);
+        }
+    }
+
+    async clearBrowserCache() {
+        try {
+            console.log('🧹 Attempting to clear browser cache...');
+            
+            // Clear various caches that might help
+            if ('caches' in window) {
+                const cacheNames = await caches.keys();
+                await Promise.all(
+                    cacheNames.map(cacheName => caches.delete(cacheName))
+                );
+                console.log('✅ Service worker caches cleared');
+            }
+            
+            // Clear sessionStorage
+            sessionStorage.clear();
+            console.log('✅ Session storage cleared');
+            
+            // Remove any problematic localStorage items (but keep our state)
+            const keysToRemove = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && !key.startsWith('tgstat_') && !key.startsWith('chrome-extension://')) {
+                    keysToRemove.push(key);
+                }
+            }
+            keysToRemove.forEach(key => localStorage.removeItem(key));
+            console.log(`✅ Cleared ${keysToRemove.length} localStorage items`);
+              } catch (error) {
+            console.error('⚠️ Error clearing cache:', error);
+        }
     }
 
     getCurrentCategoryName() {
         if (this.currentCategory) {
             return this.currentCategory.name.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
         }
-        
-        // Try to determine from URL
+          // Try to determine from URL
         const path = window.location.pathname;
         const category = path.split('/')[1] || 'unknown';
         return category.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+    }
+
+    // Debug method to check current state - accessible via console
+    async debugState() {
+        console.log('🔍 CURRENT SCRAPER STATE DEBUG:');
+        console.log('=====================================');
+        
+        // Check saved state in storage
+        const result = await chrome.storage.local.get([
+            this.lastSavedStateKey,
+            `${this.lastSavedStateKey}_backup`,
+            this.dataStorageKey,
+            this.categoryProgressKey,
+            this.autoModeKey
+        ]);
+        
+        console.log('📊 Current Memory State:', {
+            isRunning: this.isRunning,
+            autoMode: this.autoMode,
+            currentPage: this.stats.currentPage,
+            loadMoreCount: this.stats.loadMoreCount,
+            pageCount: this.stats.pageCount,
+            channelCount: this.stats.channelCount,
+            lastOffset: this.stats.lastOffset,
+            lastSuccessfulPage: this.stats.lastSuccessfulPage,
+            category: this.categoryProgress.currentCategoryName,
+            categoryIndex: this.currentCategoryIndex,
+            scrapedDataLength: this.scrapedData.length
+        });
+        
+        console.log('💾 Saved State in Storage:', {
+            hasSavedState: !!result[this.lastSavedStateKey],
+            hasBackupState: !!result[`${this.lastSavedStateKey}_backup`],
+            savedStats: result[this.lastSavedStateKey]?.stats,
+            savedDataLength: result[this.dataStorageKey]?.length || 0,
+            categoryProgress: result[this.categoryProgressKey],
+            autoMode: result[this.autoModeKey]
+        });
+        
+        // Check localStorage for refresh state
+        const refreshKey = 'tgstat_refresh_in_progress';
+        const stateKey = 'tgstat_pre_refresh_state';
+        const hasRefreshState = localStorage.getItem(refreshKey) === 'true';
+        const preRefreshState = localStorage.getItem(stateKey);
+        
+        console.log('🔄 Refresh State:', {
+            refreshInProgress: hasRefreshState,
+            hasPreRefreshState: !!preRefreshState,
+            preRefreshState: preRefreshState ? JSON.parse(preRefreshState) : null
+        });
+        
+        // Check form fields
+        const pageInput = document.querySelector('.lm-page');
+        const offsetInput = document.querySelector('.lm-offset');
+        
+        console.log('📄 Form State:', {
+            pageInputValue: pageInput?.value,
+            offsetInputValue: offsetInput?.value,
+            formDataPage: this.formData?.get('page'),
+            formDataOffset: this.formData?.get('offset')
+        });
+        
+        console.log('=====================================');
+        console.log('🚀 Next actions that will happen:');
+        console.log(`- Next page to load: ${this.stats.currentPage + 1}`);
+        console.log(`- Next offset to load: ${this.stats.lastOffset + 20}`);
+        console.log(`- Form is set to page: ${pageInput?.value}, offset: ${offsetInput?.value}`);
+        
+        return {
+            memoryState: this.stats,
+            savedState: result[this.lastSavedStateKey]?.stats,
+            formState: { page: pageInput?.value, offset: offsetInput?.value }
+        };
     }
 
     // ...existing code...
@@ -1652,9 +2164,14 @@ if (!window.tgstatScraperInitialized) {
             }
         }
     });
-    
-    // Make scraper globally accessible for debugging
+      // Make scraper globally accessible for debugging
     window.tgstatScraper = scraper;
+    
+    // Add global debug functions
+    window.debugTGStatState = () => scraper.debugState();
+    window.debugTGStatScraper = scraper; // Full access to scraper
+    
+    console.log('🔧 DEBUG: Access scraper state with window.debugTGStatState() or window.debugTGStatScraper');
     
     // Show indicator when scraper starts (only add listener once)
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

@@ -53,10 +53,14 @@ class TGStatScraperBackground {
                     await this.saveStorageData(message.data);
                     sendResponse({ success: true });
                     break;
-                
-                case 'CLEAR_STORAGE_DATA':
+                  case 'CLEAR_STORAGE_DATA':
                     await this.clearStorageData();
                     sendResponse({ success: true });
+                    break;
+                
+                case 'DOWNLOAD_DATA':
+                    const downloadResult = await this.downloadData(message.data);
+                    sendResponse(downloadResult);
                     break;
                 
                 default:
@@ -132,6 +136,32 @@ class TGStatScraperBackground {
             }
         } catch (error) {
             console.error('Error cleaning up old data:', error);
+        }
+    }    async downloadData(downloadRequest) {
+        try {
+            const { data, filename } = downloadRequest;
+            
+            if (!data || data.length === 0) {
+                return { success: false, error: 'No data to download' };
+            }
+            
+            // Convert data to base64 data URL instead of using blob URLs
+            const jsonString = JSON.stringify(data, null, 2);
+            const base64Data = btoa(unescape(encodeURIComponent(jsonString)));
+            const dataUrl = `data:application/json;base64,${base64Data}`;
+            
+            const downloadId = await chrome.downloads.download({
+                url: dataUrl,
+                filename: filename,
+                saveAs: false
+            });
+            
+            console.log(`Downloaded ${data.length} items as ${filename}`);
+            return { success: true, downloadId: downloadId };
+            
+        } catch (error) {
+            console.error('Error downloading data:', error);
+            return { success: false, error: error.message };
         }
     }
 }

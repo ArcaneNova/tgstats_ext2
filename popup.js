@@ -46,12 +46,15 @@ class TGStatScraperPopup {
             progressFill: document.getElementById('progressFill'),
             downloadOptions: document.getElementById('downloadOptions'),
             downloadJson: document.getElementById('downloadJson'),
-            downloadCsv: document.getElementById('downloadCsv'),
-            warning: document.getElementById('warning'),
+            downloadCsv: document.getElementById('downloadCsv'),            warning: document.getElementById('warning'),
             resetBtn: document.getElementById('resetBtn'),
-            categoryInfo: document.getElementById('categoryInfo'),
-            categorySelect: document.getElementById('categorySelect'),
-            navigateBtn: document.getElementById('navigateBtn')
+            categoryInfo: document.getElementById('categoryInfo'),            categorySelect: document.getElementById('categorySelect'),
+            navigateBtn: document.getElementById('navigateBtn'),
+            startPageInput: document.getElementById('startPageInput'),
+            setStartPageBtn: document.getElementById('setStartPageBtn'),
+            setCurrentPageBtn: document.getElementById('setCurrentPageBtn'),
+            setCurrentPlus5Btn: document.getElementById('setCurrentPlus5Btn'),
+            setCurrentPlus10Btn: document.getElementById('setCurrentPlus10Btn')
         };
     }    async checkScraperStatus() {
         try {
@@ -82,9 +85,23 @@ class TGStatScraperPopup {
         this.elements.resetBtn.addEventListener('click', () => this.resetProgress());
         this.elements.downloadJson.addEventListener('click', () => this.downloadData('json'));
         this.elements.downloadCsv.addEventListener('click', () => this.downloadData('csv'));
-        
-        if (this.elements.navigateBtn) {
+          if (this.elements.navigateBtn) {
             this.elements.navigateBtn.addEventListener('click', () => this.navigateToCategory());
+        }
+          if (this.elements.setStartPageBtn) {
+            this.elements.setStartPageBtn.addEventListener('click', () => this.setStartPage());
+        }
+        
+        if (this.elements.setCurrentPageBtn) {
+            this.elements.setCurrentPageBtn.addEventListener('click', () => this.setQuickStartPage(0));
+        }
+        
+        if (this.elements.setCurrentPlus5Btn) {
+            this.elements.setCurrentPlus5Btn.addEventListener('click', () => this.setQuickStartPage(5));
+        }
+        
+        if (this.elements.setCurrentPlus10Btn) {
+            this.elements.setCurrentPlus10Btn.addEventListener('click', () => this.setQuickStartPage(10));
         }
 
         // Listen for updates from content script
@@ -256,7 +273,7 @@ class TGStatScraperPopup {
             this.scrapedData = this.scrapedData.concat(data.newChannels);
             this.saveData();
         }
-    }updateStatsDisplay(stats = null) {
+    }    updateStatsDisplay(stats = null) {
         const currentStats = stats || this.stats;
         
         if (this.elements.channelCount) {
@@ -267,6 +284,11 @@ class TGStatScraperPopup {
         }
         if (this.elements.pageCount) {
             this.elements.pageCount.textContent = currentStats.pageCount.toLocaleString();
+        }
+        
+        // Update start page input placeholder with current page
+        if (this.elements.startPageInput && currentStats.currentPage) {
+            this.elements.startPageInput.placeholder = `Current: ${currentStats.currentPage}`;
         }
         
         // Update progress bar
@@ -464,9 +486,7 @@ class TGStatScraperPopup {
                 this.elements.categorySelect.appendChild(option);
             });
         }
-    }
-
-    async navigateToCategory() {
+    }    async navigateToCategory() {
         try {
             const selectedIndex = this.elements.categorySelect.value;
             if (selectedIndex === '') return;
@@ -480,6 +500,83 @@ class TGStatScraperPopup {
             }
         } catch (error) {
             console.error('Error navigating to category:', error);
+        }
+    }    async setStartPage() {
+        try {
+            const startPage = parseInt(this.elements.startPageInput.value);
+            
+            if (!startPage || startPage < 1) {
+                alert('Please enter a valid page number (minimum 1)');
+                return;
+            }
+            
+            if (startPage > 999) {
+                alert('Page number too high. Maximum is 999.');
+                return;
+            }
+            
+            // Confirm the action
+            const confirmMessage = `Set start page to ${startPage}?\n\nThis will:\n- Set current page to ${startPage}\n- Set load more count to ${startPage - 1}\n- Update form fields accordingly\n\nContinue?`;
+            if (!confirm(confirmMessage)) {
+                return;
+            }
+            
+            const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (tab) {
+                const response = await chrome.tabs.sendMessage(tab.id, { 
+                    type: 'SET_START_PAGE', 
+                    startPage: startPage 
+                });
+                
+                if (response && response.success) {
+                    // Update local stats display
+                    this.stats.currentPage = startPage;
+                    this.stats.loadMoreCount = startPage - 1;
+                    this.stats.pageCount = startPage;
+                    this.stats.lastOffset = (startPage - 1) * 20;
+                    
+                    // Update UI
+                    this.updateStatsDisplay();
+                    
+                    // Clear the input
+                    this.elements.startPageInput.value = '';
+                    
+                    // Show success message
+                    this.updateStatus(`Start page set to ${startPage}. Ready to continue scraping.`, 'warning');
+                    
+                    console.log(`✅ Start page set to ${startPage}`);
+                } else {
+                    alert('Failed to set start page. Make sure you are on a tgstat.ru page.');
+                }
+            }
+        } catch (error) {
+            console.error('Error setting start page:', error);
+            alert('Error setting start page. Please try again.');
+        }
+    }
+
+    async setQuickStartPage(offset) {
+        try {
+            const currentPage = this.stats.currentPage || 1;
+            const targetPage = currentPage + offset;
+            
+            if (targetPage < 1) {
+                alert('Target page cannot be less than 1');
+                return;
+            }
+            
+            if (targetPage > 999) {
+                alert('Target page too high. Maximum is 999.');
+                return;
+            }
+            
+            // Set the value in the input field and trigger the set operation
+            this.elements.startPageInput.value = targetPage.toString();
+            await this.setStartPage();
+            
+        } catch (error) {
+            console.error('Error setting quick start page:', error);
+            alert('Error setting start page. Please try again.');
         }
     }
 
