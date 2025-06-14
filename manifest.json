@@ -1,0 +1,35 @@
+{
+    "manifest_version": 3,
+    "name": "TGStat Scraper",
+    "version": "1.0",
+    "description": "Scrape channels from tgstat.ru",
+    "icons": {
+        "48": "icon48.png"
+    },
+    "permissions": [
+        "storage",
+        "downloads",
+        "tabs",
+        "scripting",
+        "notifications"
+    ],
+    "host_permissions": [
+        "https://tgstat.ru/*"
+    ],
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": {
+            "48": "icon48.png"
+        }
+    },
+    "content_scripts": [
+        {
+            "matches": ["https://tgstat.ru/*"],
+            "js": ["content.js"],
+            "run_at": "document_end"
+        }
+    ],
+    "background": {
+        "service_worker": "background.js"
+    }
+}
