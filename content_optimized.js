@@ -558,28 +558,61 @@ class TGStatScraperPro {
             stats: this.stats
         });
     }
-    
-    async scrapeAllChannels() {
+      async scrapeAllChannels() {
         let hasMorePages = true;
         let retryCount = 0;
         let pageStartTime = Date.now();
+        let lastProcessedPage = 0; // Track which page we last processed
+
+        // Add debugging to detect page skips
+        console.log(`🔍 SCRAPING DEBUG: Starting at page ${this.stats.currentPage}`);
         
         while (hasMorePages && this.isRunning) {
             try {
+                // CRITICAL FIX: Detect page skipping and force correct page processing
+                if (lastProcessedPage > 0 && this.stats.currentPage > lastProcessedPage + 1) {
+                    console.log(`❌ PAGE SKIP DETECTED! From ${lastProcessedPage} to ${this.stats.currentPage}`);
+                    console.log(`🔧 FIXING: Setting current page back to ${lastProcessedPage + 1}`);
+                    this.stats.currentPage = lastProcessedPage + 1;
+                }
+
+                // Store current page for skip detection
+                lastProcessedPage = this.stats.currentPage;
+                
                 console.log(`📄 Processing page ${this.stats.currentPage}...`);
                 
-                // Update status
+                // Update status with more detail
                 this.sendUpdate({
                     status: 'scraping',
                     message: `Processing page ${this.stats.currentPage} - ${this.categoryProgress.currentCategoryName || 'Unknown'}`,
                     stats: this.stats,
-                    categoryProgress: this.categoryProgress
+                    categoryProgress: this.categoryProgress,
+                    // Add more details about page processing
+                    progressDetails: {
+                        pageStart: pageStartTime,
+                        currentTime: Date.now(),
+                        elapsedTime: Date.now() - pageStartTime,
+                        retryCount: retryCount
+                    }
                 });
                 
-                // Scrape current page
+                // SPEED OPTIMIZATION: Only wait minimal time between page processing
+                if (Date.now() - pageStartTime < 300) {
+                    const cooldownTime = 300 - (Date.now() - pageStartTime);
+                    if (cooldownTime > 0) {
+                        await this.delay(cooldownTime);
+                    }
+                }
+                
+                // Reset page timer
+                pageStartTime = Date.now();
+                
+                // Scrape current page with detailed timing
+                console.time(`Page ${this.stats.currentPage} scraping`);
                 const startTime = Date.now();
                 const newChannels = await this.scrapeCurrentPage();
                 const processingTime = Date.now() - startTime;
+                console.timeEnd(`Page ${this.stats.currentPage} scraping`);
                 
                 if (newChannels && newChannels.length > 0) {
                     console.log(`✅ Found ${newChannels.length} new channels on page ${this.stats.currentPage}`);
@@ -840,15 +873,20 @@ class TGStatScraperPro {
             console.error('Error extracting channel data:', error);
             return null;
         }
-    }
-      async loadMoreWithRetry() {
+    }    async loadMoreWithRetry() {
         let attempts = 0;
-        const maxRetries = 8; // Increase max retries for better reliability
+        const maxRetries = 15; // Increased to 15 retries per user request (10+)
+        let lastApproach = '';
+        
+        // Start with faster initial attempts
+        let retryDelay = 500; // Start with short delay
+        
+        console.log(`⚙️ Load more with retry - attempting up to ${maxRetries} times`);
         
         while (attempts < maxRetries && this.isRunning) {
             try {
-                // Check if navigation was successful (we're still on the category page)
-                if (!window.location.href.includes(this.currentCategory?.url.split('//')[1])) {
+                // Check if we need to ensure we're on the right page
+                if (attempts > 0 && !window.location.href.includes(this.currentCategory?.url.split('//')[1])) {
                     console.log('⚠️ Not on the expected category page, attempting to navigate back');
                     try {
                         window.location.href = this.currentCategory.url;
@@ -859,50 +897,139 @@ class TGStatScraperPro {
                     }
                 }
                 
-                // Try clicking the load more button
-                const success = await this.clickLoadMore();
+                // SPEED OPTIMIZATION: Use different approaches based on retry count
+                // This ensures we try multiple techniques quickly rather than the same one repeatedly
+                let success = false;
+                
+                if (attempts % 4 === 0) { // Standard approach
+                    console.log(`🔄 [Attempt ${attempts+1}/${maxRetries}] Standard load more button click`);
+                    lastApproach = 'standard';
+                    success = await this.clickLoadMore();
+                }
+                else if (attempts % 4 === 1) { // AJAX approach
+                    console.log(`🔄 [Attempt ${attempts+1}/${maxRetries}] Direct AJAX request`);
+                    lastApproach = 'ajax';
+                    success = await this.triggerLoadMoreDirect();
+                }
+                else if (attempts % 4 === 2) { // Custom button approach
+                    console.log(`🔄 [Attempt ${attempts+1}/${maxRetries}] Custom button creation`);
+                    lastApproach = 'custom';
+                    success = await this.createAndClickLoadMore();
+                }
+                else { // DOM manipulation approach
+                    console.log(`🔄 [Attempt ${attempts+1}/${maxRetries}] DOM manipulation`);
+                    lastApproach = 'dom';
+                    
+                    // First scroll to ensure everything is visible
+                    window.scrollTo(0, document.body.scrollHeight);
+                    await this.delay(300);
+                    
+                    // Try to modify page/offset inputs directly
+                    const pageInputs = document.querySelectorAll('.lm-page, input[name="page"], [data-role="page-input"]');
+                    const offsetInputs = document.querySelectorAll('.lm-offset, input[name="offset"], [data-role="offset-input"]');
+                    
+                    // Update all form inputs
+                    let nextPage = this.stats.currentPage + 1;
+                    let nextOffset = this.stats.currentPage * 20;
+                    
+                    pageInputs.forEach(input => {
+                        input.value = nextPage.toString();
+                    });
+                    
+                    offsetInputs.forEach(input => {
+                        input.value = nextOffset.toString();
+                    });
+                    
+                    // Click any load more button
+                    const buttons = document.querySelectorAll('.lm-button, button.load-more, [data-role="load-more"]');
+                    let clicked = false;
+                    
+                    for (const button of buttons) {
+                        try {
+                            button.click();
+                            clicked = true;
+                            break;
+                        } catch (e) {
+                            // Continue trying other buttons
+                        }
+                    }
+                    
+                    // If clicked, wait for content
+                    if (clicked) {
+                        await this.delay(2000);
+                        const initialCount = document.querySelectorAll('.peer-item-box, .card').length;
+                        success = await this.waitForNewContent(initialCount);
+                    } else {
+                        success = false;
+                    }
+                }
+                
                 if (success) {
                     // Successfully loaded more content
                     this.stats.loadMoreCount++;
                     this.consecutiveEmptyPages = 0;
+                    console.log(`✅ Load more successful using approach: ${lastApproach}`);
                     return true;
                 }
                 
                 attempts++;
-                console.log(`🔄 Load more attempt ${attempts}/${maxRetries} failed`);
+                
+                // Log with progress percentage
+                const progressPercent = Math.round((attempts / maxRetries) * 100);
+                console.log(`⚠️ Load more attempt ${attempts}/${maxRetries} failed (${progressPercent}%) with approach: ${lastApproach}`);
                 
                 if (attempts < maxRetries) {
-                    // Increase delay with each attempt for better reliability
-                    await this.delay(this.retryDelay * (1 + attempts * 0.5));
+                    // SPEED OPTIMIZATION: Adaptive retry timing
+                    // - Start fast (500ms)
+                    // - Increase delay gradually up to 2.5s
+                    // - Add some random variation to avoid getting stuck in patterns
                     
-                    // Try different approaches on different retries
-                    if (attempts === 3) {
+                    if (attempts < 5) {
+                        // Early attempts: fast retries
+                        retryDelay = 500 + (attempts * 200) + Math.random() * 300;
+                    } else if (attempts < 10) {
+                        // Mid attempts: moderate delays
+                        retryDelay = 1500 + Math.random() * 1000;
+                    } else {
+                        // Later attempts: longer delays with more aggressive approaches
+                        retryDelay = 2500 + Math.random() * 1000;
+                    }
+                    
+                    console.log(`⏱️ Waiting ${Math.round(retryDelay/1000)} seconds before next attempt...`);
+                    await this.delay(retryDelay);
+                    
+                    // Every third retry, try something more aggressive
+                    if (attempts % 3 === 0) {
                         console.log('🔄 Trying page refresh approach...');
-                        const currentUrl = window.location.href;
-                        window.location.reload();
-                        await new Promise(resolve => setTimeout(resolve, 5000));
-                    } else if (attempts === 5) {
-                        console.log('🔄 Trying scroll approach...');
-                        window.scrollTo(0, document.body.scrollHeight);
-                        await this.delay(2000);
-                        window.scrollTo(0, document.body.scrollHeight - 500);
-                        await this.delay(1000);
+                        try {
+                            const currentUrl = window.location.href;
+                            window.location.reload();
+                            await new Promise(resolve => setTimeout(resolve, 4000));
+                        } catch (e) {
+                            console.error('Page refresh error:', e);
+                        }
                     }
                 }
                 
             } catch (error) {
-                console.error('Error in load more retry:', error);
+                console.error(`Error in load more retry (attempt ${attempts+1}/${maxRetries}):`, error);
                 attempts++;
-                await this.delay(this.retryDelay * (1 + attempts * 0.5));
+                await this.delay(1000 + (attempts * 300));
             }
         }
         
-        console.log('❌ Load more failed after all retries');
+        console.log(`❌ Load more failed after maximum ${maxRetries} retries`);
         return false;
-    }
-      async clickLoadMore() {
+    }    async clickLoadMore() {
         try {
-            // Try multiple selectors for the load more button
+            // Get current DOM items count for later comparison
+            const initialItemCount = document.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box').length;
+            console.log(`📊 Current items on page: ${initialItemCount}`);
+            
+            // Debug current page state
+            console.log(`🔍 DEBUG: Current page: ${this.stats.currentPage}, Next expected: ${this.stats.currentPage + 1}`);
+            
+            // Try multiple selectors for the load more button with improved logging
             const loadMoreSelectors = [
                 '.lm-button', 
                 'button.lm-button', 
@@ -910,16 +1037,32 @@ class TGStatScraperPro {
                 'button.load-more',
                 'a.load-more',
                 '.load-more-btn',
+                '[data-role="load_more"]',
                 'button:contains("Load more")',
-                'button:contains("Загрузить еще")'
+                'button:contains("Загрузить еще")',
+                '.ajax-btn' // Additional selector
             ];
             
             let loadMoreBtn = null;
             for (const selector of loadMoreSelectors) {
                 try {
-                    loadMoreBtn = document.querySelector(selector);
-                    if (loadMoreBtn) {
-                        console.log(`🔍 Found load more button using selector: ${selector}`);
+                    const buttons = document.querySelectorAll(selector);
+                    if (buttons.length > 0) {
+                        // Prefer visible buttons
+                        for (const btn of buttons) {
+                            const style = window.getComputedStyle(btn);
+                            if (style.display !== 'none' && style.visibility !== 'hidden') {
+                                loadMoreBtn = btn;
+                                console.log(`🔍 Found visible load more button using selector: ${selector}`);
+                                break;
+                            }
+                        }
+                        
+                        // If no visible button found, use the first one
+                        if (!loadMoreBtn) {
+                            loadMoreBtn = buttons[0];
+                            console.log(`🔍 Found load more button (might be hidden) using selector: ${selector}`);
+                        }
                         break;
                     }
                 } catch (selectorError) {
@@ -928,39 +1071,66 @@ class TGStatScraperPro {
             }
             
             if (!loadMoreBtn) {
-                console.log('🏁 Load more button not found - may have reached end');
+                console.log('🏁 Load more button not found - attempting alternative methods');
                 
-                // Try to find hidden button and make it visible
-                const hiddenButtons = document.querySelectorAll('button.d-none, .btn.d-none');
+                // Method 1: Try to find hidden button and make it visible
+                const hiddenButtons = document.querySelectorAll('button.d-none, .btn.d-none, [style*="display: none"]');
                 for (const hiddenBtn of hiddenButtons) {
-                    if (hiddenBtn.textContent.includes('Load') || 
-                        hiddenBtn.textContent.includes('load') ||
-                        hiddenBtn.textContent.includes('Загрузить')) {
+                    const btnText = hiddenBtn.textContent.toLowerCase();
+                    if (btnText.includes('load') || 
+                        btnText.includes('more') ||
+                        btnText.includes('загрузить') ||
+                        btnText.includes('еще') ||
+                        btnText.includes('далее')) {
                         console.log('🔍 Found hidden button, making it visible');
                         hiddenBtn.classList.remove('d-none');
+                        hiddenBtn.style.display = '';
+                        hiddenBtn.style.visibility = 'visible';
                         loadMoreBtn = hiddenBtn;
                         break;
                     }
+                }
+                
+                // Method 2: Try direct AJAX request if we have the form
+                if (!loadMoreBtn) {
+                    const form = document.querySelector('form[data-role="load-more-form"], .load-more-form');
+                    if (form) {
+                        console.log('🔄 No button found but found form, trying direct AJAX approach');
+                        return await this.triggerLoadMoreDirect();
+                    }
+                }
+                
+                // Method 3: Try creating our own button
+                if (!loadMoreBtn) {
+                    return await this.createAndClickLoadMore();
                 }
                 
                 if (!loadMoreBtn) return false;
             }
             
             // Check if already loading
-            const loaderSelectors = ['.lm-loader', '.loader', '.spinning', '.loading'];
+            const loaderSelectors = ['.lm-loader', '.loader', '.spinning', '.loading', '.ajax-loading'];
             let loader = null;
+            let isLoading = false;
+            
             for (const selector of loaderSelectors) {
                 loader = document.querySelector(selector);
-                if (loader && !loader.classList.contains('d-none')) {
-                    console.log('⏳ Already loading, waiting...');
-                    await this.delay(3000);
-                    return await this.clickLoadMore();
+                if (loader && !loader.classList.contains('d-none') && 
+                   window.getComputedStyle(loader).display !== 'none') {
+                    isLoading = true;
+                    break;
                 }
             }
             
-            // Get form fields - try multiple selectors
-            const pageInputSelectors = ['.lm-page', 'input[name="page"]', '[data-role="page-input"]'];
-            const offsetInputSelectors = ['.lm-offset', 'input[name="offset"]', '[data-role="offset-input"]'];
+            if (isLoading) {
+                console.log('⏳ Already loading, waiting...');
+                await this.delay(3000);
+                return await this.clickLoadMore();
+            }
+            
+            // Get form fields - try multiple selectors 
+            const pageInputSelectors = ['.lm-page', 'input[name="page"]', '[data-role="page-input"]', 'input.page'];
+            const offsetInputSelectors = ['.lm-offset', 'input[name="offset"]', '[data-role="offset-input"]', 'input.offset'];
             
             let pageInput = null;
             let offsetInput = null;
@@ -975,42 +1145,70 @@ class TGStatScraperPro {
                 if (offsetInput) break;
             }
             
-            // If form fields not found, try to extract info from URL or data attributes
-            let nextPage = this.stats.currentPage + 1;
+            // CRITICAL FIX: Always ensure we're going to the next sequential page
+            // This fixes the 1, 3, 5, ... skipping issue
+            let nextPage = this.stats.currentPage + 1; // Always increment by 1
             let nextOffset = this.stats.currentPage * 20;
-            
-            if (pageInput) {
-                nextPage = parseInt(pageInput.value) || nextPage;
-            }
-            
-            if (offsetInput) {
-                nextOffset = parseInt(offsetInput.value) || nextOffset;
-            } else if (loadMoreBtn.dataset.offset) {
-                nextOffset = parseInt(loadMoreBtn.dataset.offset);
-            }
             
             console.log(`📤 Loading page ${nextPage}, offset ${nextOffset}`);
             
-            // Show loader
+            // Update form inputs if available BEFORE clicking
+            if (pageInput) {
+                pageInput.value = nextPage.toString();
+                console.log(`📝 Set page input to: ${nextPage}`);
+            }
+            
+            if (offsetInput) {
+                offsetInput.value = nextOffset.toString();
+                console.log(`📝 Set offset input to: ${nextOffset}`);
+            }
+            
+            // Show loader if available
             if (loader) loader.classList.remove('d-none');
             
-            // Click load more
-            loadMoreBtn.click();
+            // Execute click with careful error handling
+            try {
+                console.log('🖱️ Clicking load more button');
+                loadMoreBtn.click();
+            } catch (clickError) {
+                console.error('Click error:', clickError);
+                // Try alternative: simulate click
+                try {
+                    console.log('�️ Simulating click event');
+                    const event = new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    });
+                    loadMoreBtn.dispatchEvent(event);
+                } catch (eventError) {
+                    console.error('Event simulation error:', eventError);
+                    return false;
+                }
+            }
             
-            // Wait for content to load
-            const success = await this.waitForNewContent();
+            // Wait for content to load with improved detection
+            const success = await this.waitForNewContent(initialItemCount);
             
             if (success) {
-                // Update stats
+                // Update stats - CRITICAL: ensure we're incrementing by 1
                 this.stats.currentPage = nextPage;
                 this.stats.lastOffset = nextOffset;
                 this.stats.loadMoreCount++;
                 this.stats.pageCount++;
                 this.loadMoreFailureCount = 0;
                 
-                // Update form for next load
-                pageInput.value = (nextPage + 1).toString();
-                offsetInput.value = (nextOffset + 20).toString();
+                // Update form for next load (if needed)
+                if (pageInput) {
+                    // Set it to next+1 for the next operation
+                    pageInput.value = (nextPage + 1).toString();
+                    console.log(`📝 Updated page input for next load: ${nextPage + 1}`);
+                }
+                
+                if (offsetInput) {
+                    offsetInput.value = (nextOffset + 20).toString();
+                    console.log(`📝 Updated offset input for next load: ${nextOffset + 20}`);
+                }
                 
                 console.log(`✅ Successfully loaded page ${nextPage}`);
                 return true;
@@ -1024,27 +1222,127 @@ class TGStatScraperPro {
             return false;
         }
     }
-    
-    async waitForNewContent() {
-        const maxWait = 20000; // 20 seconds max
-        const checkInterval = 500; // Check every 500ms
+      async waitForNewContent(initialCount = null) {
+        const maxWait = 30000; // 30 seconds max (increased from 20)
+        const checkInterval = 200; // Check every 200ms (faster checks)
         let waited = 0;
-        let lastItemCount = document.querySelectorAll('.peer-item-box').length;
         
+        // Use multiple selectors to find items
+        const itemSelectors = [
+            '.peer-item-box', 
+            '.card.card-body.peer-item-box',
+            '.col-12.col-sm-6.col-md-4 .card',
+            '.card', 
+            '.item-box'
+        ];
+        
+        // Get initial item count
+        let lastItemCount = initialCount;
+        if (lastItemCount === null) {
+            for (const selector of itemSelectors) {
+                const items = document.querySelectorAll(selector);
+                if (items.length > 0) {
+                    lastItemCount = items.length;
+                    console.log(`📊 Initial count: ${lastItemCount} items using selector: ${selector}`);
+                    break;
+                }
+            }
+        }
+        
+        // If still null, try a fallback selector
+        if (lastItemCount === null) {
+            lastItemCount = document.querySelectorAll('div[class*="card"], div[class*="item"]').length;
+            console.log(`📊 Initial count (fallback): ${lastItemCount} items`);
+        }
+        
+        console.log(`⏳ Waiting for new content beyond ${lastItemCount} items...`);
+        
+        // Store the last check time for DOM mutations
+        let lastCheckTime = Date.now();
+        let contentChangedSince = false;
+        
+        // Set up mutation observer to detect DOM changes
+        const observer = new MutationObserver(() => {
+            contentChangedSince = true;
+        });
+        
+        // Watch for changes in the main content area
+        const contentArea = document.querySelector('.card-list, .cards-list, .channels-list, .peer-list, .container, main');
+        if (contentArea) {
+            observer.observe(contentArea, { 
+                childList: true, 
+                subtree: true,
+                attributes: true,
+                characterData: true
+            });
+        }
+        
+        // Start checking for new content
         while (waited < maxWait && this.isRunning) {
-            const loader = document.querySelector('.lm-loader');
-            const isLoading = loader && !loader.classList.contains('d-none');
+            // Check multiple loading indicators
+            let isLoading = false;
+            const loaderSelectors = ['.lm-loader', '.loader', '.spinning', '.loading', '.ajax-loading'];
             
-            if (!isLoading) {
-                await this.delay(1000); // Wait a bit more for content
+            for (const selector of loaderSelectors) {
+                const loader = document.querySelector(selector);
+                if (loader && !loader.classList.contains('d-none') && 
+                   window.getComputedStyle(loader).display !== 'none') {
+                    isLoading = true;
+                    break;
+                }
+            }
+            
+            // If not loading or waited > 3 seconds, check for new content
+            if (!isLoading || waited > 3000) {
+                // Check if DOM has changed since last check
+                if (contentChangedSince) {
+                    console.log('📝 DOM changes detected, checking content...');
+                }
                 
-                const currentItemCount = document.querySelectorAll('.peer-item-box').length;
+                // Reset the flag
+                contentChangedSince = false;
+                
+                // Try multiple selectors to find new items
+                let currentItemCount = 0;
+                let usedSelector = '';
+                
+                for (const selector of itemSelectors) {
+                    const items = document.querySelectorAll(selector);
+                    if (items.length > 0) {
+                        currentItemCount = items.length;
+                        usedSelector = selector;
+                        break;
+                    }
+                }
+                
+                // If no items found with standard selectors, try fallback
+                if (currentItemCount === 0) {
+                    currentItemCount = document.querySelectorAll('div[class*="card"], div[class*="item"]').length;
+                    usedSelector = 'fallback';
+                }
+                
+                // Compare with last count
                 if (currentItemCount > lastItemCount) {
-                    console.log(`📈 New content loaded: ${currentItemCount - lastItemCount} items`);
+                    console.log(`📈 New content loaded: ${currentItemCount - lastItemCount} items (using ${usedSelector})`);
+                    observer.disconnect(); // Clean up observer
                     return true;
-                } else if (waited > 5000) { // Give it at least 5 seconds
-                    console.log('📭 No new content found');
+                } else if (waited > 10000 && !isLoading) { // Give it at least 10 seconds
+                    console.log(`📭 No new content found after ${waited}ms (still at ${currentItemCount} items)`);
+                    observer.disconnect(); // Clean up observer
                     return false;
+                }
+                
+                // Log current status every 5 seconds
+                if (Date.now() - lastCheckTime > 5000) {
+                    console.log(`⏳ Still waiting... Current: ${currentItemCount}, Original: ${lastItemCount}, Time: ${waited/1000}s`);
+                    lastCheckTime = Date.now();
+                    
+                    // Try scrolling to trigger lazy loading
+                    if (waited > 5000) {
+                        window.scrollTo(0, document.body.scrollHeight);
+                        await this.delay(300);
+                        window.scrollTo(0, document.body.scrollHeight - 500);
+                    }
                 }
             }
             
@@ -1052,7 +1350,8 @@ class TGStatScraperPro {
             waited += checkInterval;
         }
         
-        console.log('⏰ Timeout waiting for new content');
+        observer.disconnect(); // Clean up observer
+        console.log(`⏰ Timeout after ${maxWait/1000}s waiting for new content`);
         return false;
     }
       async processDataQueue() {
@@ -1501,6 +1800,207 @@ class TGStatScraperPro {
             return true;
         } catch (error) {
             console.error('Error downloading category data:', error);
+            return false;
+        }
+    }
+    
+    // Try direct AJAX approach to load more content
+    async triggerLoadMoreDirect() {
+        try {
+            console.log('🔄 Attempting direct AJAX load more');
+            
+            // Find the form and get its data
+            const form = document.querySelector('form[data-role="load-more-form"], .load-more-form');
+            
+            if (!form) {
+                console.log('❌ No load-more form found');
+                return false;
+            }
+            
+            // Get the form action URL
+            const url = form.action || window.location.href;
+            
+            // Create form data
+            const formData = new FormData(form);
+            
+            // Ensure we're going to the next sequential page
+            const nextPage = this.stats.currentPage + 1;
+            const nextOffset = this.stats.currentPage * 20;
+            
+            // Update form data
+            formData.set('page', nextPage.toString());
+            formData.set('offset', nextOffset.toString());
+            
+            console.log(`📝 Form initialized for page ${nextPage}, offset ${nextOffset}`);
+            
+            // Convert FormData to URL-encoded string
+            const data = [...formData.entries()]
+                .map(x => `${encodeURIComponent(x[0])}=${encodeURIComponent(x[1])}`)
+                .join('&');
+            
+            // Show loader if available
+            const loader = document.querySelector('.lm-loader, .loader, .spinning, .loading');
+            if (loader) loader.classList.remove('d-none');
+            
+            // Get initial item count
+            const initialItemCount = document.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box').length;
+            
+            // Make AJAX request
+            console.log(`🌐 Making AJAX request to: ${url}`);
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: data
+            });
+            
+            if (!response.ok) {
+                console.error(`❌ AJAX error: ${response.status} ${response.statusText}`);
+                return false;
+            }
+            
+            // Try to process the response differently based on content type
+            const contentType = response.headers.get('content-type');
+            
+            if (contentType && contentType.includes('application/json')) {
+                // Handle JSON response
+                const json = await response.json();
+                
+                if (json.html) {
+                    // Create a temporary div to hold the new content
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = json.html;
+                    
+                    // Find the container to append to
+                    const container = document.querySelector('.card-list, .cards-list, .channels-list, .peer-list');
+                    
+                    if (container) {
+                        // Append new items
+                        container.appendChild(tempDiv);
+                        
+                        // Update stats
+                        this.stats.currentPage = nextPage;
+                        this.stats.lastOffset = nextOffset;
+                        this.stats.loadMoreCount++;
+                        this.stats.pageCount++;
+                        
+                        console.log(`✅ Successfully loaded page ${nextPage} via AJAX JSON`);
+                        return true;
+                    }
+                }
+            } else {
+                // Handle HTML response
+                const html = await response.text();
+                
+                // Create a temporary div to hold the new content
+                const tempDiv = document.createElement('div');
+                tempDiv.innerHTML = html;
+                
+                // Find new items in the response
+                const newItems = tempDiv.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box');
+                
+                if (newItems.length > 0) {
+                    // Find the container to append to
+                    const container = document.querySelector('.card-list, .cards-list, .channels-list, .peer-list');
+                    
+                    if (container) {
+                        // Append each new item
+                        newItems.forEach(item => {
+                            container.appendChild(item);
+                        });
+                        
+                        // Update stats
+                        this.stats.currentPage = nextPage;
+                        this.stats.lastOffset = nextOffset;
+                        this.stats.loadMoreCount++;
+                        this.stats.pageCount++;
+                        
+                        console.log(`✅ Successfully loaded page ${nextPage} via AJAX HTML`);
+                        return true;
+                    }
+                }
+            }
+            
+            // Check if new content loaded
+            await this.delay(2000);
+            const currentItemCount = document.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box').length;
+            
+            if (currentItemCount > initialItemCount) {
+                // Update stats
+                this.stats.currentPage = nextPage;
+                this.stats.lastOffset = nextOffset;
+                this.stats.loadMoreCount++;
+                this.stats.pageCount++;
+                
+                console.log(`✅ Successfully loaded page ${nextPage} (detected by item count)`);
+                return true;
+            }
+            
+            console.log('❌ Direct AJAX request failed to load new content');
+            return false;
+            
+        } catch (error) {
+            console.error('Error in direct AJAX approach:', error);
+            return false;
+        }
+    }
+    
+    // Create and click our own load more button
+    async createAndClickLoadMore() {
+        try {
+            console.log('🔧 Creating custom load more button');
+            
+            // Find the form container
+            const formContainer = document.querySelector('.lm-form-container, .load-more-container');
+            
+            if (!formContainer) {
+                console.log('❌ No form container found for custom button');
+                return false;
+            }
+            
+            // Create a new button
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'btn btn-primary custom-load-more';
+            button.textContent = 'Load More';
+            button.dataset.page = (this.stats.currentPage + 1).toString();
+            button.dataset.offset = (this.stats.currentPage * 20).toString();
+            
+            // Add it to the page
+            formContainer.appendChild(button);
+            
+            // Get initial item count
+            const initialItemCount = document.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box').length;
+            
+            // Click the button
+            button.click();
+            
+            // Wait for content to load
+            await this.delay(3000);
+            
+            // Check if new content loaded
+            const currentItemCount = document.querySelectorAll('.peer-item-box, .card, .card.card-body.peer-item-box').length;
+            
+            if (currentItemCount > initialItemCount) {
+                // Update stats
+                this.stats.currentPage = this.stats.currentPage + 1;
+                this.stats.loadMoreCount++;
+                this.stats.pageCount++;
+                
+                console.log(`✅ Successfully loaded page ${this.stats.currentPage} with custom button`);
+                return true;
+            }
+            
+            // Remove the custom button to avoid confusion
+            button.remove();
+            
+            console.log('❌ Custom button approach failed');
+            return false;
+            
+        } catch (error) {
+            console.error('Error creating custom load more button:', error);
             return false;
         }
     }

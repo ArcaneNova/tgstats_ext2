@@ -1,3 +1,4 @@
+
 class TGStatScraperPopupPro {
     constructor() {
         this.isRunning = false;

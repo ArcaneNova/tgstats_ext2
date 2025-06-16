@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
-    "name": "TGStat Scraper",
-    "version": "1.0",
-    "description": "Scrape channels from tgstat.ru",
+    "name": "TGStat Scraper Pro",
+    "version": "2.0",
+    "description": "Advanced Telegram channel scraper with zero data loss protection",
     "icons": {
         "48": "icon48.png"
     },
@@ -11,10 +11,14 @@
         "downloads",
         "tabs",
         "scripting",
-        "notifications"
+        "notifications",
+        "alarms",
+        "activeTab",
+        "background"
     ],
     "host_permissions": [
-        "https://tgstat.ru/*"
+        "https://tgstat.ru/*",
+        "https://*/*"
     ],
     "action": {
         "default_popup": "popup.html",
@@ -26,10 +30,12 @@
         {
             "matches": ["https://tgstat.ru/*"],
             "js": ["content.js"],
-            "run_at": "document_end"
+            "run_at": "document_end",
+            "all_frames": false
         }
     ],
     "background": {
-        "service_worker": "background.js"
+        "service_worker": "background.js",
+        "type": "module"
     }
 }
